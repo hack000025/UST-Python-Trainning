@@ -6,6 +6,7 @@ from __future__ import annotations
 import difflib
 import os
 import re
+from collections import Counter
 from typing import Any, Dict, List, Sequence, Tuple
 
 try:
@@ -65,44 +66,22 @@ def extract_words_from_pdf(pdf_path: str) -> Tuple[List[List[PDFWord]], bytes]:
     return words_pages, pdf_bytes
 
 
-def _normalized_key(words: Sequence[PDFWord]) -> Tuple[str, ...]:
-    """Return a tuple representing the normalized contents of a chunk."""
-    return tuple(word["normalized"] for word in words if word.get("normalized"))
-
-
-def _filter_swapped_diffs(diffs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Remove delete/insert pairs that represent moved/swapped text.
-
-    If a deleted chunk has an identical counterpart inserted elsewhere, treat it as a move
-    and drop both entries so no highlight is produced.
-    """
-    insert_buckets: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
-    skipped_ids: set[int] = set()
-
-    for diff in diffs:
-        if diff["type"] != "inserted":
-            continue
-        key = _normalized_key(diff["words"])
+def _consume_budget(words: Sequence[PDFWord], budget: Counter) -> List[PDFWord]:
+    """Return the subset of words that still have budget (i.e., truly added/removed)."""
+    selected: List[PDFWord] = []
+    for word in words:
+        key = word.get("normalized")
         if not key:
             continue
-        insert_buckets.setdefault(key, []).append(diff)
-
-    for diff in diffs:
-        if diff["type"] != "deleted":
+        remaining = budget.get(key, 0)
+        if remaining <= 0:
             continue
-        key = _normalized_key(diff["words"])
-        if not key:
-            continue
-        bucket = insert_buckets.get(key)
-        if not bucket:
-            continue
-        partner = bucket.pop(0)
-        skipped_ids.update({id(diff), id(partner)})
-        if not bucket:
-            del insert_buckets[key]
-
-    return [diff for diff in diffs if id(diff) not in skipped_ids]
+        selected.append(word)
+        if remaining == 1:
+            del budget[key]
+        else:
+            budget[key] = remaining - 1
+    return selected
 
 
 def compute_word_diffs(
@@ -115,6 +94,9 @@ def compute_word_diffs(
     words1 = [word["normalized"] for word in words1_full]
     words2 = [word["normalized"] for word in words2_full]
 
+    deleted_budget = Counter(words1) - Counter(words2)
+    inserted_budget = Counter(words2) - Counter(words1)
+
     matcher = difflib.SequenceMatcher(a=words1, b=words2, autojunk=False)
     diffs: List[Dict[str, Any]] = []
 
@@ -122,21 +104,21 @@ def compute_word_diffs(
         if tag == "equal":
             continue
         if tag == "delete":
-            chunk = words1_full[i1:i2]
+            chunk = _consume_budget(words1_full[i1:i2], deleted_budget)
             if chunk:
                 diffs.append(
                     {"type": "deleted", "words": chunk, "text": chunk_text(chunk)}
                 )
         elif tag == "insert":
-            chunk = words2_full[j1:j2]
+            chunk = _consume_budget(words2_full[j1:j2], inserted_budget)
             if chunk:
                 diffs.append(
                     {"type": "inserted", "words": chunk, "text": chunk_text(chunk)}
                 )
         elif tag == "replace":
-            old_chunk = words1_full[i1:i2]
-            new_chunk = words2_full[j1:j2]
-            if old_chunk or new_chunk:
+            old_chunk = _consume_budget(words1_full[i1:i2], deleted_budget)
+            new_chunk = _consume_budget(words2_full[j1:j2], inserted_budget)
+            if old_chunk and new_chunk:
                 diffs.append(
                     {
                         "type": "replaced",
@@ -146,8 +128,16 @@ def compute_word_diffs(
                         "new_text": chunk_text(new_chunk),
                     }
                 )
+            elif old_chunk:
+                diffs.append(
+                    {"type": "deleted", "words": old_chunk, "text": chunk_text(old_chunk)}
+                )
+            elif new_chunk:
+                diffs.append(
+                    {"type": "inserted", "words": new_chunk, "text": chunk_text(new_chunk)}
+                )
 
-    return _filter_swapped_diffs(diffs)
+    return diffs
 
 
 def _annotate_words(
