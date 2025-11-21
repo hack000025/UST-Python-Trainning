@@ -65,6 +65,46 @@ def extract_words_from_pdf(pdf_path: str) -> Tuple[List[List[PDFWord]], bytes]:
     return words_pages, pdf_bytes
 
 
+def _normalized_key(words: Sequence[PDFWord]) -> Tuple[str, ...]:
+    """Return a tuple representing the normalized contents of a chunk."""
+    return tuple(word["normalized"] for word in words if word.get("normalized"))
+
+
+def _filter_swapped_diffs(diffs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Remove delete/insert pairs that represent moved/swapped text.
+
+    If a deleted chunk has an identical counterpart inserted elsewhere, treat it as a move
+    and drop both entries so no highlight is produced.
+    """
+    insert_buckets: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
+    skipped_ids: set[int] = set()
+
+    for diff in diffs:
+        if diff["type"] != "inserted":
+            continue
+        key = _normalized_key(diff["words"])
+        if not key:
+            continue
+        insert_buckets.setdefault(key, []).append(diff)
+
+    for diff in diffs:
+        if diff["type"] != "deleted":
+            continue
+        key = _normalized_key(diff["words"])
+        if not key:
+            continue
+        bucket = insert_buckets.get(key)
+        if not bucket:
+            continue
+        partner = bucket.pop(0)
+        skipped_ids.update({id(diff), id(partner)})
+        if not bucket:
+            del insert_buckets[key]
+
+    return [diff for diff in diffs if id(diff) not in skipped_ids]
+
+
 def compute_word_diffs(
     words_pages1: List[List[PDFWord]], words_pages2: List[List[PDFWord]]
 ) -> List[Dict[str, Any]]:
@@ -107,7 +147,7 @@ def compute_word_diffs(
                     }
                 )
 
-    return diffs
+    return _filter_swapped_diffs(diffs)
 
 
 def _annotate_words(
