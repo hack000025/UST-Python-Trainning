@@ -7,7 +7,7 @@ import difflib
 import os
 import re
 from collections import Counter
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     import fitz  # PyMuPDF
@@ -73,33 +73,88 @@ def _flatten_words(words_pages: List[List[PDFWord]]) -> List[PDFWord]:
 
 def _sentence_boundary(text: str) -> bool:
     """Heuristic to decide whether a word ends a sentence."""
-    return bool(re.search(r"[.!?…]+$",
-                text.strip()))
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return bool(re.search(r"[.!?…]+$", stripped))
+
+
+def _paragraph_boundary(word: PDFWord) -> bool:
+    """Detect paragraph shifts using block/line metadata."""
+    return word.get("line") == 0 and word.get("word") == 0
 
 
 def build_sentences(words_pages: List[List[PDFWord]]) -> List[Dict[str, Any]]:
-    """Group words into sentence-level units."""
+    """Group words into sentence-level units with optional paragraph hints."""
     sentences: List[Dict[str, Any]] = []
     current: List[PDFWord] = []
+    paragraph_tag = 0
 
     for word in _flatten_words(words_pages):
+        if _paragraph_boundary(word) and current:
+            sentences.append(_finalize_sentence(current, paragraph_tag))
+            current = []
+            paragraph_tag += 1
+
         current.append(word)
         if _sentence_boundary(word["text"]):
-            sentences.append(_finalize_sentence(current))
+            sentences.append(_finalize_sentence(current, paragraph_tag))
             current = []
 
     if current:
-        sentences.append(_finalize_sentence(current))
+        sentences.append(_finalize_sentence(current, paragraph_tag))
 
     return sentences
 
 
-def _finalize_sentence(words: List[PDFWord]) -> Dict[str, Any]:
+def _finalize_sentence(words: List[PDFWord], paragraph_tag: int) -> Dict[str, Any]:
     text = chunk_text(words)
     normalized_sentence = " ".join(
         word["normalized"] for word in words if word.get("normalized")
     )
-    return {"words": words.copy(), "text": text, "normalized": normalized_sentence}
+    start_page = words[0]["page"] if words else 0
+    return {
+        "words": words.copy(),
+        "text": text,
+        "normalized": normalized_sentence,
+        "paragraph": paragraph_tag,
+        "page": start_page,
+    }
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """Return a similarity ratio for normalized sentences."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(a=a, b=b, autojunk=False).ratio()
+
+
+def _sentence_key(sentence: Dict[str, Any]) -> str:
+    """Key used for sentence-level budgets."""
+    return sentence.get("normalized", "")
+
+
+def _consume_sentence_budget(
+    sentences: Sequence[Dict[str, Any]], budget: Counter
+) -> List[Dict[str, Any]]:
+    """Filter out sentences whose occurrences are balanced (i.e., merely moved)."""
+    selected: List[Dict[str, Any]] = []
+    for sentence in sentences:
+        key = _sentence_key(sentence)
+        if not key:
+            selected.append(sentence)
+            continue
+        remaining = budget.get(key, 0)
+        if remaining <= 0:
+            continue
+        selected.append(sentence)
+        if remaining == 1:
+            del budget[key]
+        else:
+            budget[key] = remaining - 1
+    return selected
 
 
 def _consume_sentence_budget(
@@ -122,11 +177,26 @@ def _consume_sentence_budget(
     return selected
 
 
+def _filter_by_paragraph_window(
+    candidates: List[Dict[str, Any]], target_paragraph: int, window: int = 1
+) -> List[Dict[str, Any]]:
+    """Restrict candidate sentences to those within a paragraph window."""
+    return [
+        candidate
+        for candidate in candidates
+        if abs(candidate.get("paragraph", 0) - target_paragraph) <= window
+    ]
+
+
 def _pair_sentences(
-    old_sentences: List[Dict[str, Any]], new_sentences: List[Dict[str, Any]]
+    old_sentences: List[Dict[str, Any]],
+    new_sentences: List[Dict[str, Any]],
+    *,
+    similarity_threshold: float = 0.6,
+    paragraph_window: int = 2,
 ) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Greedily pair sentences across old/new sets using string similarity.
+    Greedily pair sentences across old/new sets using string similarity with paragraph hints.
 
     Returns (paired, leftover_old, leftover_new).
     """
@@ -135,16 +205,17 @@ def _pair_sentences(
     leftover_old: List[Dict[str, Any]] = []
 
     for old in old_sentences:
-        best_idx = -1
+        candidates = _filter_by_paragraph_window(
+            remaining_new, old.get("paragraph", 0), paragraph_window
+        )
+        best_idx: Optional[int] = None
         best_score = 0.0
-        for idx, new in enumerate(remaining_new):
-            score = difflib.SequenceMatcher(
-                a=old["normalized"], b=new["normalized"]
-            ).ratio()
+        for candidate in candidates:
+            score = _text_similarity(old["normalized"], candidate["normalized"])
             if score > best_score:
                 best_score = score
-                best_idx = idx
-        if best_idx >= 0 and best_score >= 0.6:
+                best_idx = remaining_new.index(candidate)
+        if best_idx is not None and best_score >= similarity_threshold:
             pairs.append((old, remaining_new.pop(best_idx)))
         else:
             leftover_old.append(old)
@@ -209,8 +280,8 @@ def compute_word_diffs(
     sentences1 = build_sentences(words_pages1)
     sentences2 = build_sentences(words_pages2)
 
-    keys1 = [sentence["normalized"] for sentence in sentences1]
-    keys2 = [sentence["normalized"] for sentence in sentences2]
+    keys1 = [_sentence_key(sentence) for sentence in sentences1]
+    keys2 = [_sentence_key(sentence) for sentence in sentences2]
 
     deleted_budget = Counter(keys1) - Counter(keys2)
     inserted_budget = Counter(keys2) - Counter(keys1)
@@ -240,7 +311,9 @@ def compute_word_diffs(
         elif tag == "replace":
             old_block = _consume_sentence_budget(sentences1[i1:i2], deleted_budget)
             new_block = _consume_sentence_budget(sentences2[j1:j2], inserted_budget)
-            pairs, leftover_old, leftover_new = _pair_sentences(old_block, new_block)
+            pairs, leftover_old, leftover_new = _pair_sentences(
+                old_block, new_block, similarity_threshold=0.7, paragraph_window=3
+            )
 
             for old_sentence, new_sentence in pairs:
                 diffs.extend(
