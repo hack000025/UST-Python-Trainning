@@ -80,9 +80,19 @@ def _sentence_boundary(text: str) -> bool:
     return bool(re.search(r"[.!?…]+$", stripped))
 
 
-def _paragraph_boundary(word: PDFWord) -> bool:
-    """Detect paragraph shifts using block/line metadata."""
-    return word.get("line") == 0 and word.get("word") == 0
+def _paragraph_boundary(current: Sequence[PDFWord], next_word: PDFWord) -> bool:
+    """
+    Detect paragraph shifts using block/line metadata without splitting sentences mid-page.
+
+    Treat a new block/line as a paragraph boundary only if the current sentence already
+    ended (i.e., previous word had sentence punctuation).
+    """
+    if not current:
+        return False
+    if next_word.get("line") != 0 or next_word.get("word") != 0:
+        return False
+    last_text = current[-1]["text"]
+    return _sentence_boundary(last_text)
 
 
 def build_sentences(words_pages: List[List[PDFWord]]) -> List[Dict[str, Any]]:
@@ -92,7 +102,7 @@ def build_sentences(words_pages: List[List[PDFWord]]) -> List[Dict[str, Any]]:
     paragraph_tag = 0
 
     for word in _flatten_words(words_pages):
-        if _paragraph_boundary(word) and current:
+        if _paragraph_boundary(current, word):
             sentences.append(_finalize_sentence(current, paragraph_tag))
             current = []
             paragraph_tag += 1
@@ -101,6 +111,7 @@ def build_sentences(words_pages: List[List[PDFWord]]) -> List[Dict[str, Any]]:
         if _sentence_boundary(word["text"]):
             sentences.append(_finalize_sentence(current, paragraph_tag))
             current = []
+            paragraph_tag += 1
 
     if current:
         sentences.append(_finalize_sentence(current, paragraph_tag))
