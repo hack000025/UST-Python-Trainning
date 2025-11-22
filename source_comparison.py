@@ -66,17 +66,55 @@ def extract_words_from_pdf(pdf_path: str) -> Tuple[List[List[PDFWord]], bytes]:
     return words_pages, pdf_bytes
 
 
-def _consume_budget(words: Sequence[PDFWord], budget: Counter) -> List[PDFWord]:
-    """Return the subset of words that still have budget (i.e., truly added/removed)."""
-    selected: List[PDFWord] = []
-    for word in words:
-        key = word.get("normalized")
+def _flatten_words(words_pages: List[List[PDFWord]]) -> List[PDFWord]:
+    """Flatten words across all pages while keeping order."""
+    return [word for page in words_pages for word in page]
+
+
+def _sentence_boundary(text: str) -> bool:
+    """Heuristic to decide whether a word ends a sentence."""
+    return bool(re.search(r"[.!?…]+$",
+                text.strip()))
+
+
+def build_sentences(words_pages: List[List[PDFWord]]) -> List[Dict[str, Any]]:
+    """Group words into sentence-level units."""
+    sentences: List[Dict[str, Any]] = []
+    current: List[PDFWord] = []
+
+    for word in _flatten_words(words_pages):
+        current.append(word)
+        if _sentence_boundary(word["text"]):
+            sentences.append(_finalize_sentence(current))
+            current = []
+
+    if current:
+        sentences.append(_finalize_sentence(current))
+
+    return sentences
+
+
+def _finalize_sentence(words: List[PDFWord]) -> Dict[str, Any]:
+    text = chunk_text(words)
+    normalized_sentence = " ".join(
+        word["normalized"] for word in words if word.get("normalized")
+    )
+    return {"words": words.copy(), "text": text, "normalized": normalized_sentence}
+
+
+def _consume_sentence_budget(
+    sentences: Sequence[Dict[str, Any]], budget: Counter
+) -> List[Dict[str, Any]]:
+    """Filter out sentences whose occurrences are balanced (i.e., merely moved)."""
+    selected: List[Dict[str, Any]] = []
+    for sentence in sentences:
+        key = sentence.get("normalized")
         if not key:
             continue
         remaining = budget.get(key, 0)
         if remaining <= 0:
             continue
-        selected.append(word)
+        selected.append(sentence)
         if remaining == 1:
             del budget[key]
         else:
@@ -84,42 +122,66 @@ def _consume_budget(words: Sequence[PDFWord], budget: Counter) -> List[PDFWord]:
     return selected
 
 
-def compute_word_diffs(
-    words_pages1: List[List[PDFWord]], words_pages2: List[List[PDFWord]]
+def _pair_sentences(
+    old_sentences: List[Dict[str, Any]], new_sentences: List[Dict[str, Any]]
+) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Greedily pair sentences across old/new sets using string similarity.
+
+    Returns (paired, leftover_old, leftover_new).
+    """
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    remaining_new = new_sentences.copy()
+    leftover_old: List[Dict[str, Any]] = []
+
+    for old in old_sentences:
+        best_idx = -1
+        best_score = 0.0
+        for idx, new in enumerate(remaining_new):
+            score = difflib.SequenceMatcher(
+                a=old["normalized"], b=new["normalized"]
+            ).ratio()
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        if best_idx >= 0 and best_score >= 0.6:
+            pairs.append((old, remaining_new.pop(best_idx)))
+        else:
+            leftover_old.append(old)
+
+    leftover_new = remaining_new
+    return pairs, leftover_old, leftover_new
+
+
+def _diff_sentence_words(
+    old_words: Sequence[PDFWord], new_words: Sequence[PDFWord]
 ) -> List[Dict[str, Any]]:
-    """Generate word-level diff metadata using difflib."""
-    words1_full = [word for page in words_pages1 for word in page]
-    words2_full = [word for page in words_pages2 for word in page]
-
-    words1 = [word["normalized"] for word in words1_full]
-    words2 = [word["normalized"] for word in words2_full]
-
-    deleted_budget = Counter(words1) - Counter(words2)
-    inserted_budget = Counter(words2) - Counter(words1)
-
+    """Compute word-level diffs confined to a single sentence."""
+    words1 = [word["normalized"] for word in old_words]
+    words2 = [word["normalized"] for word in new_words]
     matcher = difflib.SequenceMatcher(a=words1, b=words2, autojunk=False)
-    diffs: List[Dict[str, Any]] = []
+    sentence_diffs: List[Dict[str, Any]] = []
 
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             continue
         if tag == "delete":
-            chunk = _consume_budget(words1_full[i1:i2], deleted_budget)
+            chunk = list(old_words[i1:i2])
             if chunk:
-                diffs.append(
+                sentence_diffs.append(
                     {"type": "deleted", "words": chunk, "text": chunk_text(chunk)}
                 )
         elif tag == "insert":
-            chunk = _consume_budget(words2_full[j1:j2], inserted_budget)
+            chunk = list(new_words[j1:j2])
             if chunk:
-                diffs.append(
+                sentence_diffs.append(
                     {"type": "inserted", "words": chunk, "text": chunk_text(chunk)}
                 )
         elif tag == "replace":
-            old_chunk = _consume_budget(words1_full[i1:i2], deleted_budget)
-            new_chunk = _consume_budget(words2_full[j1:j2], inserted_budget)
+            old_chunk = list(old_words[i1:i2])
+            new_chunk = list(new_words[j1:j2])
             if old_chunk and new_chunk:
-                diffs.append(
+                sentence_diffs.append(
                     {
                         "type": "replaced",
                         "old": old_chunk,
@@ -129,13 +191,72 @@ def compute_word_diffs(
                     }
                 )
             elif old_chunk:
-                diffs.append(
+                sentence_diffs.append(
                     {"type": "deleted", "words": old_chunk, "text": chunk_text(old_chunk)}
                 )
             elif new_chunk:
-                diffs.append(
+                sentence_diffs.append(
                     {"type": "inserted", "words": new_chunk, "text": chunk_text(new_chunk)}
                 )
+
+    return sentence_diffs
+
+
+def compute_word_diffs(
+    words_pages1: List[List[PDFWord]], words_pages2: List[List[PDFWord]]
+) -> List[Dict[str, Any]]:
+    """Generate diff metadata with sentence alignment to avoid flagging moved text."""
+    sentences1 = build_sentences(words_pages1)
+    sentences2 = build_sentences(words_pages2)
+
+    keys1 = [sentence["normalized"] for sentence in sentences1]
+    keys2 = [sentence["normalized"] for sentence in sentences2]
+
+    deleted_budget = Counter(keys1) - Counter(keys2)
+    inserted_budget = Counter(keys2) - Counter(keys1)
+
+    matcher = difflib.SequenceMatcher(a=keys1, b=keys2, autojunk=False)
+    diffs: List[Dict[str, Any]] = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "delete":
+            deleted = _consume_sentence_budget(sentences1[i1:i2], deleted_budget)
+            for sentence in deleted:
+                words = sentence["words"]
+                if words:
+                    diffs.append(
+                        {"type": "deleted", "words": words, "text": sentence["text"]}
+                    )
+        elif tag == "insert":
+            inserted = _consume_sentence_budget(sentences2[j1:j2], inserted_budget)
+            for sentence in inserted:
+                words = sentence["words"]
+                if words:
+                    diffs.append(
+                        {"type": "inserted", "words": words, "text": sentence["text"]}
+                    )
+        elif tag == "replace":
+            old_block = _consume_sentence_budget(sentences1[i1:i2], deleted_budget)
+            new_block = _consume_sentence_budget(sentences2[j1:j2], inserted_budget)
+            pairs, leftover_old, leftover_new = _pair_sentences(old_block, new_block)
+
+            for old_sentence, new_sentence in pairs:
+                diffs.extend(
+                    _diff_sentence_words(old_sentence["words"], new_sentence["words"])
+                )
+
+            for sentence in leftover_old:
+                if sentence["words"]:
+                    diffs.append(
+                        {"type": "deleted", "words": sentence["words"], "text": sentence["text"]}
+                    )
+            for sentence in leftover_new:
+                if sentence["words"]:
+                    diffs.append(
+                        {"type": "inserted", "words": sentence["words"], "text": sentence["text"]}
+                    )
 
     return diffs
 
