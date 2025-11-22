@@ -8,7 +8,7 @@ import os
 import re
 from collections import Counter
 from functools import lru_cache
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
     import fitz  # PyMuPDF
@@ -70,6 +70,27 @@ def extract_words_from_pdf(pdf_path: str) -> Tuple[List[List[PDFWord]], bytes]:
 def _flatten_words(words_pages: List[List[PDFWord]]) -> List[PDFWord]:
     """Flatten words across all pages while keeping order."""
     return [word for page in words_pages for word in page]
+
+
+def _document_normalized(words_pages: List[List[PDFWord]]) -> str:
+    """Create a normalized string representation of the entire document."""
+    return " ".join(
+        word["normalized"]
+        for page in words_pages
+        for word in page
+        if word.get("normalized")
+    )
+
+
+def _normalized_chunk(words: Sequence[PDFWord]) -> str:
+    """Return a normalized string for a list of words."""
+    return " ".join(word["normalized"] for word in words if word.get("normalized"))
+
+
+def _chunk_exists(doc_text: str, words: Sequence[PDFWord]) -> bool:
+    """Check if a normalized chunk of words exists within a normalized document."""
+    needle = _normalized_chunk(words)
+    return bool(needle and needle in doc_text)
 
 
 def _sentence_boundary(text: str) -> bool:
@@ -318,6 +339,8 @@ def compute_word_diffs(
     """Generate diff metadata with sentence alignment to avoid flagging moved text."""
     sentences1 = build_sentences(words_pages1)
     sentences2 = build_sentences(words_pages2)
+    doc1_text = _document_normalized(words_pages1)
+    doc2_text = _document_normalized(words_pages2)
 
     keys1 = [_sentence_key(sentence) for sentence in sentences1]
     keys2 = [_sentence_key(sentence) for sentence in sentences2]
@@ -370,7 +393,35 @@ def compute_word_diffs(
                         {"type": "inserted", "words": sentence["words"], "text": sentence["text"]}
                     )
 
-    return diffs
+    return _filter_existing_text(diffs, doc1_text, doc2_text)
+
+
+def _filter_existing_text(
+    diffs: List[Dict[str, Any]], doc1_text: str, doc2_text: str
+) -> List[Dict[str, Any]]:
+    """Remove highlights if the same content exists elsewhere in the opposite document."""
+    filtered: List[Dict[str, Any]] = []
+    for diff in diffs:
+        dtype = diff["type"]
+        if dtype == "deleted":
+            if _chunk_exists(doc2_text, diff["words"]):
+                continue
+        elif dtype == "inserted":
+            if _chunk_exists(doc1_text, diff["words"]):
+                continue
+        elif dtype == "replaced":
+            old_chunk = diff.get("old") or []
+            new_chunk = diff.get("new") or []
+            if _chunk_exists(doc2_text, old_chunk):
+                diff["old"] = []
+                diff["old_text"] = ""
+            if _chunk_exists(doc1_text, new_chunk):
+                diff["new"] = []
+                diff["new_text"] = ""
+            if not diff.get("old") and not diff.get("new"):
+                continue
+        filtered.append(diff)
+    return filtered
 
 
 def _annotate_words(
