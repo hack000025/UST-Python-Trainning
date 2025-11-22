@@ -7,6 +7,7 @@ import difflib
 import os
 import re
 from collections import Counter
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
@@ -122,6 +123,7 @@ def _finalize_sentence(words: List[PDFWord], paragraph_tag: int) -> Dict[str, An
     }
 
 
+@lru_cache(maxsize=8_192)
 def _text_similarity(a: str, b: str) -> float:
     """Return a similarity ratio for normalized sentences."""
     if not a and not b:
@@ -200,11 +202,36 @@ def _pair_sentences(
 
     Returns (paired, leftover_old, leftover_new).
     """
+    if not old_sentences or not new_sentences:
+        return [], old_sentences, new_sentences
+
     pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     remaining_new = new_sentences.copy()
     leftover_old: List[Dict[str, Any]] = []
 
+    exact_new_map: Dict[str, List[Dict[str, Any]]] = {}
+    for sentence in remaining_new:
+        key = _sentence_key(sentence)
+        if key:
+            exact_new_map.setdefault(key, []).append(sentence)
+
+    unmatched_old: List[Dict[str, Any]] = []
+
     for old in old_sentences:
+        key = _sentence_key(old)
+        bucket = exact_new_map.get(key) if key else None
+        if bucket:
+            partner = bucket.pop(0)
+            pairs.append((old, partner))
+            remaining_new.remove(partner)
+            if not bucket:
+                del exact_new_map[key]
+            continue
+        unmatched_old.append(old)
+
+    unmatched_leftovers: List[Dict[str, Any]] = []
+
+    for old in unmatched_old:
         candidates = _filter_by_paragraph_window(
             remaining_new, old.get("paragraph", 0), paragraph_window
         )
@@ -218,8 +245,9 @@ def _pair_sentences(
         if best_idx is not None and best_score >= similarity_threshold:
             pairs.append((old, remaining_new.pop(best_idx)))
         else:
-            leftover_old.append(old)
+            unmatched_leftovers.append(old)
 
+    leftover_old.extend(unmatched_leftovers)
     leftover_new = remaining_new
     return pairs, leftover_old, leftover_new
 
